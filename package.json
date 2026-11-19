@@ -1,6 +1,6 @@
 {
   "name": "com610-parcial2-api-libros",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "API REST de catálogo de libros en EC2 + RDS con CI/CD en GitHub Actions (COM610)",
   "main": "src/server.js",
   "scripts": {

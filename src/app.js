@@ -15,6 +15,7 @@ function createApp(repository) {
       status: 'ok',
       service: 'api-libros-apinedo',
       version: pkg.version,
+      message: 'API de libros desplegada automáticamente con CI/CD v1.1.0',
       timestamp: new Date().toISOString()
     });
   });
