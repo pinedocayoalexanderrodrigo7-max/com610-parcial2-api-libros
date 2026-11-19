@@ -4,7 +4,7 @@ const { createPool } = require('./db');
 const { createLibrosRepository } = require('./librosRepository');
 const { createApp } = require('./app');
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = 4000; // prueba fallo healthcheck
 const pool = createPool();
 const repository = createLibrosRepository(pool);
 const app = createApp(repository);
