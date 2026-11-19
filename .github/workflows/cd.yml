@@ -1,0 +1,195 @@
+name: CD - Test, Build, Push y Deploy en EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Pruebas automatizadas
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar pruebas
+        run: npm test
+
+  build-and-push:
+    name: Construir y publicar imagen Docker en GHCR
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Normalizar usuario del registro en minúsculas
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+        run: |
+          echo "IMAGE_OWNER=${REGISTRY_USERNAME,,}" >> "$GITHUB_ENV"
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Iniciar sesión en GitHub Container Registry (ghcr.io)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Construir y publicar imagen etiquetada con SHA
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_OWNER }}/api-libros-apinedo:${{ github.sha }}
+            ghcr.io/${{ env.IMAGE_OWNER }}/api-libros-apinedo:latest
+
+  deploy:
+    name: Desplegar y verificar en Amazon EC2
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Normalizar usuario del registro en minúsculas
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+        run: |
+          echo "IMAGE_OWNER=${REGISTRY_USERNAME,,}" >> "$GITHUB_ENV"
+
+      - name: Configurar credenciales AWS de despliegue
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Abrir SSH temporal al runner de GitHub Actions
+        env:
+          EC2_SG_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+        run: |
+          RUNNER_IP=$(curl -sf https://checkip.amazonaws.com | tr -d '[:space:]')
+          echo "RUNNER_IP=${RUNNER_IP}" >> "$GITHUB_ENV"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$EC2_SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32" || true
+          sleep 3
+
+      - name: Desplegar contenedor y verificar salud en EC2
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_OWNER: ${{ env.IMAGE_OWNER }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+          IMAGE_TAG: ${{ github.sha }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          envs: IMAGE_OWNER,REGISTRY_USERNAME,REGISTRY_TOKEN,IMAGE_TAG
+          script: |
+            set -euo pipefail
+
+            IMAGE="ghcr.io/${IMAGE_OWNER}/api-libros-apinedo:${IMAGE_TAG}"
+            echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USERNAME" --password-stdin
+            docker pull "$IMAGE"
+
+            PREV_IMAGE=$(docker inspect --format='{{.Config.Image}}' api-libros 2>/dev/null || true)
+
+            # 1. Lanzar contenedor candidato en puerto interno 127.0.0.1:3001 para validación previa
+            docker rm -f api-libros-candidate >/dev/null 2>&1 || true
+            docker run -d \
+              --name api-libros-candidate \
+              -p 127.0.0.1:3001:3000 \
+              --env-file /opt/api-libros/.env \
+              "$IMAGE"
+
+            CANDIDATE_OK=false
+            for i in $(seq 1 10); do
+              if curl -sf http://127.0.0.1:3001/health >/dev/null && curl -sf http://127.0.0.1:3001/libros >/dev/null; then
+                CANDIDATE_OK=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$CANDIDATE_OK" != "true" ]; then
+              echo "ERROR: La nueva versión falló la verificación en /health o /libros. Se conserva el contenedor anterior."
+              docker logs api-libros-candidate || true
+              docker rm -f api-libros-candidate >/dev/null 2>&1 || true
+              docker logout ghcr.io >/dev/null 2>&1 || true
+              exit 1
+            fi
+
+            # 2. Promover nueva versión al puerto interno 127.0.0.1:3000 detrás de Nginx
+            docker rm -f api-libros-candidate >/dev/null 2>&1 || true
+            docker stop api-libros >/dev/null 2>&1 || true
+            docker rm api-libros >/dev/null 2>&1 || true
+
+            docker run -d \
+              --name api-libros \
+              --restart unless-stopped \
+              -p 127.0.0.1:3000:3000 \
+              --env-file /opt/api-libros/.env \
+              "$IMAGE"
+
+            # 3. Verificación final a través del proxy inverso Nginx (puerto 80)
+            PROXY_OK=false
+            for i in $(seq 1 5); do
+              if curl -sf http://127.0.0.1/health >/dev/null && curl -sf http://127.0.0.1/libros >/dev/null; then
+                PROXY_OK=true
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$PROXY_OK" != "true" ]; then
+              echo "ERROR: Falló la verificación tras el cambio en Nginx. Restaurando versión anterior..."
+              docker logs api-libros || true
+              docker rm -f api-libros >/dev/null 2>&1 || true
+              if [ -n "$PREV_IMAGE" ]; then
+                docker run -d \
+                  --name api-libros \
+                  --restart unless-stopped \
+                  -p 127.0.0.1:3000:3000 \
+                  --env-file /opt/api-libros/.env \
+                  "$PREV_IMAGE"
+              fi
+              docker logout ghcr.io >/dev/null 2>&1 || true
+              exit 1
+            fi
+
+            echo "Despliegue exitoso. Respuesta actual de /health:"
+            curl -sf http://127.0.0.1/health
+            echo ""
+            docker image prune -f >/dev/null 2>&1 || true
+            docker logout ghcr.io >/dev/null 2>&1 || true
+
+      - name: Cerrar SSH temporal del runner de GitHub Actions
+        if: always() && env.RUNNER_IP != ''
+        env:
+          EC2_SG_ID: ${{ secrets.EC2_SECURITY_GROUP_ID }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$EC2_SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "${RUNNER_IP}/32" || true

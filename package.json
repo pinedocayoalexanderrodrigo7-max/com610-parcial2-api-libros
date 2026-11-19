@@ -1,0 +1,20 @@
+{
+  "name": "com610-parcial2-api-libros",
+  "version": "1.0.0",
+  "description": "API REST de catálogo de libros en EC2 + RDS con CI/CD en GitHub Actions (COM610)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "jest --verbose",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "mysql2": "^3.11.5"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  }
+}
