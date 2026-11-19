@@ -71,7 +71,8 @@ describe('API REST de Libros (sin RDS)', () => {
     expect(res.statusCode).toBe(200);
     expect(res.body.status).toBe('ok');
     expect(res.body.service).toBe('api-libros-apinedo');
-    expect(res.body.version).toBeDefined();
+    expect(res.body.version).toBe('1.1.0');
+    expect(res.body.message).toContain('CI/CD v1.1.0');
     expect(res.body.timestamp).toBeDefined();
   });
 
